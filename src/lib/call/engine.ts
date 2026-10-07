@@ -48,6 +48,8 @@ const SIGNAL_RETRY_LIMIT = 4;
 const BUSY_HOLD_MS = 2_000;
 /** ...but never keep a refused channel alive longer than this. */
 const BUSY_DEADLINE_MS = 15_000;
+/** How long a freshly captured screen may stay muted before we send it anyway. */
+const FIRST_FRAME_WAIT_MS = 2_000;
 
 type Timer = ReturnType<typeof setTimeout>;
 
@@ -266,6 +268,20 @@ export class PeerCallEngine {
     const track = display.getVideoTracks()[0];
     if (!track) return false;
 
+    // Screen content is text and a cursor, not motion. Telling the encoder that
+    // and capping the frame rate is what keeps a 1080p capture from stalling on
+    // an ordinary upload; a rejected constraint simply leaves the defaults.
+    track.contentHint = "detail";
+    try {
+      await track.applyConstraints({
+        width: { max: 1920 },
+        height: { max: 1080 },
+        frameRate: { ideal: 15, max: 30 },
+      });
+    } catch {
+      /* keep whatever the picker chose */
+    }
+
     this.screenStream = display;
     track.addEventListener("ended", this.handleScreenEnded);
     this.swapOutboundVideo(track);
@@ -290,9 +306,9 @@ export class PeerCallEngine {
 
   /**
    * Swaps the outgoing video track on the live peer connection. Track
-   * replacement needs no renegotiation, so the remote side never sees a
-   * reconnect. When there is no video sender yet (camera-less join), we ask for
-   * a fresh media leg so the new track is negotiated in.
+   * replacement normally needs no renegotiation, so the remote side never sees
+   * a reconnect. The swap is asynchronous and can fail quietly, so the result
+   * is verified by `applyOutboundVideo`.
    */
   private swapOutboundVideo(track: MediaStreamTrack | null): void {
     if (!this.outbound) this.outbound = new MediaStream();
@@ -304,36 +320,84 @@ export class PeerCallEngine {
       this.outbound.addTrack(track);
     }
 
-    const sender = this.findVideoSender();
-    if (sender) {
-      void sender.replaceTrack(track);
-      return;
-    }
-    // No video send section exists (a call started without any camera): a new
-    // media leg has to be negotiated so the track is included.
-    if (track && this.data?.open) this.offerMediaLeg();
+    void this.applyOutboundVideo(track);
   }
 
   /**
-   * The sender carrying our video m-section. After `replaceTrack(null)` the
-   * sender has an empty track, so the transceiver is the reliable way back.
+   * Gets `track` onto the wire. Three outcomes, in order of preference:
+   *
+   *  1. the current video sender accepts it, which we confirm by reading the
+   *     sender back, because a fulfilled `replaceTrack()` is not proof that the
+   *     track is being sent,
+   *  2. otherwise a fresh media leg is negotiated, which always includes the
+   *     track we just put in the outbound stream,
+   *  3. otherwise say so — a sharer must never be left believing their screen
+   *     is visible when only they can see it.
+   */
+  private async applyOutboundVideo(track: MediaStreamTrack | null): Promise<void> {
+    if (this.teardown) return;
+
+    const sender = this.findVideoSender();
+    if (sender) {
+      if (track) await this.waitForFirstFrame(track);
+      if (this.teardown) return;
+      try {
+        await sender.replaceTrack(track);
+      } catch {
+        /* verified below, then renegotiated */
+      }
+      if (sender.track === track) return;
+    }
+
+    if (!track) return;
+    if (this.data?.open && this.peer?.open) {
+      // No usable video send section: a new media leg has to be negotiated so
+      // the track is actually included in the offer.
+      this.inviteMedia();
+      return;
+    }
+    this.announce("warning", "Your screen is not reaching the other person");
+  }
+
+  /**
+   * Chrome hands out a display track that reports `muted` until its first real
+   * frame. Replacing with it right away can leave the other side on the picture
+   * it already had, so wait briefly for the frame and never longer.
+   */
+  private waitForFirstFrame(track: MediaStreamTrack): Promise<void> {
+    if (!track.muted && track.readyState === "live") return Promise.resolve();
+
+    return new Promise((resolve) => {
+      const done = () => {
+        track.removeEventListener("unmute", done);
+        this.clear(timer);
+        resolve();
+      };
+      const timer = this.after(FIRST_FRAME_WAIT_MS, done);
+      track.addEventListener("unmute", done, { once: true });
+    });
+  }
+
+  /**
+   * The transceiver section that can put video on the wire. A `recvonly` or
+   * `inactive` section will happily accept `replaceTrack()` and send nothing,
+   * so direction is checked rather than guessed from the track alone.
    */
   private findVideoSender(): RTCRtpSender | null {
     const connection = this.media?.peerConnection;
     if (!connection) return null;
-    const direct = connection.getSenders().find((sender) => sender.track?.kind === "video");
-    if (direct) return direct;
-    const transceiver = connection
-      .getTransceivers()
-      .find((entry) => entry.receiver?.track?.kind === "video");
-    return transceiver?.sender ?? null;
-  }
 
-  /** Gets a media leg created when none exists yet, without burning retries. */
-  private offerMediaLeg(): void {
-    if (!this.data?.open || this.teardown) return;
-    if (this.outbound) this.inviteMedia();
-    else this.send({ v: 1, t: "remake" });
+    const sendable = (entry: RTCRtpTransceiver) =>
+      entry.direction === "sendrecv" || entry.direction === "sendonly";
+    const isVideoSection = (entry: RTCRtpTransceiver) =>
+      entry.sender.track?.kind === "video" ||
+      (!entry.sender.track && entry.receiver.track?.kind === "video");
+
+    const candidates = connection
+      .getTransceivers()
+      .filter((entry) => sendable(entry) && isVideoSection(entry));
+    const alreadySending = candidates.find((entry) => entry.sender.track !== null);
+    return (alreadySending ?? candidates[0])?.sender ?? null;
   }
 
   /** Remembers the partner's display name as soon as it is announced. */

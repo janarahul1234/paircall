@@ -110,6 +110,97 @@ async function remotePicture(page: Page): Promise<VideoInfo | undefined> {
   });
 }
 
+/**
+ * Replaces `getDisplayMedia` with a solid-red canvas stream.
+ *
+ * Chromium's fake devices do not cover screen capture, and the real picker
+ * cannot be automated, but the thing under test is what the app does with the
+ * track it gets back: whether swapping it into the live peer connection
+ * actually reaches the other person. A canvas gives us pixels we can predict.
+ */
+async function stubScreenShare(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 240;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    let frame = 0;
+    const paint = () => {
+      context.fillStyle = "#ff0000";
+      context.fillRect(0, 0, 320, 240);
+      // Move a marker every frame so the capture never sees a static canvas.
+      context.fillStyle = "#000000";
+      context.fillRect(frame % 2 === 0 ? 280 : 300, 200, 12, 12);
+      frame += 1;
+    };
+    paint();
+    setInterval(paint, 100);
+
+    const stream = canvas.captureStream(15);
+    const track = stream.getVideoTracks()[0];
+    if (track) {
+      Object.defineProperty(track, "label", { value: "fake-screen-stub", configurable: true });
+    }
+
+    Object.defineProperty(navigator.mediaDevices, "getDisplayMedia", {
+      configurable: true,
+      writable: true,
+      value: async () => stream,
+    });
+  });
+}
+
+/**
+ * What the partner's picture currently looks like: size plus a pixel sample.
+ * `width === 320 && red` means the stubbed screen arrived; the fake camera is
+ * 1280 wide and never uniformly red.
+ */
+async function sharedView(page: Page): Promise<{ width: number; red: boolean }> {
+  const view = await page.evaluate(() => {
+    const element = Array.from(document.querySelectorAll("video")).find(
+      (video) => !video.muted
+    );
+    if (!element || element.videoWidth === 0) {
+      return { width: 0, red: false };
+    }
+    const probe = document.createElement("canvas");
+    probe.width = element.videoWidth;
+    probe.height = element.videoHeight;
+    const context = probe.getContext("2d");
+    if (!context) return { width: element.videoWidth, red: false };
+    context.drawImage(element, 0, 0);
+    const data = context.getImageData(
+      Math.floor(element.videoWidth * 0.3),
+      Math.floor(element.videoHeight * 0.3),
+      1,
+      1
+    ).data;
+    return {
+      width: element.videoWidth,
+      red: data[0] > 200 && data[1] < 60 && data[2] < 60,
+    };
+  });
+  return view;
+}
+
+/**
+ * Makes `replaceTrack()` resolve without replacing anything.
+ *
+ * This is the failure mode a sharer cannot see: the call succeeds, the sender
+ * keeps streaming the old track, and the app has no reason to doubt it, so only
+ * the sharer ever sees the screen. A verified swap has to notice and fall back
+ * to negotiating a fresh media leg.
+ */
+async function sabotageTrackReplacement(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    RTCRtpSender.prototype.replaceTrack = function () {
+      return Promise.resolve();
+    };
+  });
+}
+
 test("two people pair, see each other's names, and a third is refused", async ({ browser }) => {
   test.setTimeout(180_000);
 
@@ -195,4 +286,115 @@ test("two people pair, see each other's names, and a third is refused", async ({
   await host.close();
   await guest.close();
   await outsider.close();
+});
+
+test("a shared screen reaches the other person in both directions", async ({ browser }) => {
+  test.setTimeout(180_000);
+
+  const host = await browser.newContext(CONTEXT_OPTIONS);
+  const guest = await browser.newContext(CONTEXT_OPTIONS);
+  const hostPage = await host.newPage();
+  const guestPage = await guest.newPage();
+  const hostErrors = collectErrors(hostPage);
+  const guestErrors = collectErrors(guestPage);
+
+  await stubScreenShare(hostPage);
+  await stubScreenShare(guestPage);
+
+  await enterName(hostPage, HOST_NAME);
+  const code = await createCall(hostPage);
+  await pressJoin(hostPage, "Start call");
+
+  await enterName(guestPage, GUEST_NAME);
+  await joinByCode(guestPage, code);
+  await pressJoin(guestPage, "Join call");
+
+  await expectConnected(hostPage, GUEST_NAME);
+  await expectConnected(guestPage, HOST_NAME);
+
+  // Baseline: each side is showing the other's fake camera, not a shared screen.
+  expect(await sharedView(guestPage)).not.toEqual({ width: 320, red: true });
+
+  /* ------------------------------------------------ host shares, guest sees -- */
+
+  await hostPage.getByRole("button", { name: "Share your screen" }).click();
+  await expect(hostPage.getByText("Your screen", { exact: true })).toBeVisible();
+
+  await expect
+    .poll(() => sharedView(guestPage), { timeout: 20_000 })
+    .toEqual({ width: 320, red: true });
+
+  /* -------------------------------------------------------- host stops it -- */
+
+  await hostPage.getByRole("button", { name: "Stop sharing screen" }).click();
+  await expect
+    .poll(async () => (await sharedView(guestPage)).width !== 320, { timeout: 20_000 })
+    .toBe(true);
+
+  /* ---------------------------------------------- guest shares, host sees -- */
+
+  await guestPage.getByRole("button", { name: "Share your screen" }).click();
+  await expect(guestPage.getByText("Your screen", { exact: true })).toBeVisible();
+
+  await expect
+    .poll(() => sharedView(hostPage), { timeout: 20_000 })
+    .toEqual({ width: 320, red: true });
+
+  await guestPage.getByRole("button", { name: "Stop sharing screen" }).click();
+  await expect
+    .poll(async () => (await sharedView(hostPage)).width !== 320, { timeout: 20_000 })
+    .toBe(true);
+
+  // Both sides must still be in one piece afterwards.
+  await expect(hostPage.getByText("Connected", { exact: true })).toBeVisible();
+  await expect(guestPage.getByText("Connected", { exact: true })).toBeVisible();
+
+  expect(hostErrors, hostErrors.join("\n")).toEqual([]);
+  expect(guestErrors, guestErrors.join("\n")).toEqual([]);
+
+  await host.close();
+  await guest.close();
+});
+
+test("a screen share that cannot be swapped in place still reaches the partner", async ({
+  browser,
+}) => {
+  test.setTimeout(180_000);
+
+  const host = await browser.newContext(CONTEXT_OPTIONS);
+  const guest = await browser.newContext(CONTEXT_OPTIONS);
+  const hostPage = await host.newPage();
+  const guestPage = await guest.newPage();
+  const hostErrors = collectErrors(hostPage);
+
+  await stubScreenShare(hostPage);
+  await sabotageTrackReplacement(hostPage);
+
+  await enterName(hostPage, HOST_NAME);
+  const code = await createCall(hostPage);
+  await pressJoin(hostPage, "Start call");
+
+  await enterName(guestPage, GUEST_NAME);
+  await joinByCode(guestPage, code);
+  await pressJoin(guestPage, "Join call");
+
+  await expectConnected(hostPage, GUEST_NAME);
+  await expectConnected(guestPage, HOST_NAME);
+
+  await hostPage.getByRole("button", { name: "Share your screen" }).click();
+  await expect(hostPage.getByText("Your screen", { exact: true })).toBeVisible();
+
+  // The in-place swap is a silent no-op here, so the app has to notice and put
+  // the screen on a freshly negotiated media leg instead.
+  await expect
+    .poll(() => sharedView(guestPage), { timeout: 30_000 })
+    .toEqual({ width: 320, red: true });
+
+  // Renegotiating must not cost the call: both sides stay connected.
+  await expect(hostPage.getByText("Connected", { exact: true })).toBeVisible();
+  await expect(guestPage.getByText("Connected", { exact: true })).toBeVisible();
+  expect(hostErrors, hostErrors.join("\n")).toEqual([]);
+
+  await host.close();
+  await guest.close();
 });
