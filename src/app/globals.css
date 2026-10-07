@@ -46,6 +46,19 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-brand-soft: var(--brand-soft);
+  --color-stage: var(--stage);
+  --animate-breathe: breathe 2.6s ease-in-out infinite;
+  --animate-notice: notice 5s ease forwards;
+}
+
+:root {
+  --brand: oklch(0.78 0.13 195);
+  --brand-foreground: oklch(0.22 0.04 200);
+  --brand-soft: oklch(0.78 0.13 195 / 14%);
+  --stage: oklch(0.17 0.014 250);
 }
 
 :root {
@@ -84,10 +97,10 @@
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
+  --background: oklch(0.15 0.012 255);
+  --foreground: oklch(0.97 0.005 240);
+  --card: oklch(0.2 0.014 255);
+  --card-foreground: oklch(0.97 0.005 240);
   --popover: oklch(0.205 0 0);
   --popover-foreground: oklch(0.985 0 0);
   --primary: oklch(0.922 0 0);
@@ -117,6 +130,38 @@
   --sidebar-ring: oklch(0.556 0 0);
 }
 
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+}
+
+/*
+ * Connection/participant messages announce themselves and then leave: one
+ * animation instead of a JS timer per toast.
+ */
+@keyframes notice {
+  0% {
+    opacity: 0;
+    transform: translateY(0.5rem);
+  }
+  8%,
+  82% {
+    opacity: 1;
+    transform: none;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(0.25rem);
+  }
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
@@ -130,4 +175,14 @@
   html {
     @apply font-sans;
   }
+  /* Video elements must never inherit odd baseline gaps. */
+  video {
+    @apply block bg-transparent;
+  }
+}
+
+@utility stage-grid {
+  background-image:
+    radial-gradient(60rem 40rem at 80% -10%, oklch(0.78 0.13 195 / 10%), transparent 60%),
+    radial-gradient(50rem 40rem at 0% 110%, oklch(0.7 0.15 280 / 8%), transparent 60%);
 }
